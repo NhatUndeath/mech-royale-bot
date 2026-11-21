@@ -26,9 +26,11 @@ message is a plain dict. Fields may be added to the protocol: read them with .ge
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
+import time
 import traceback
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
@@ -508,6 +510,10 @@ def run(make_bot: Any) -> None:
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     threading.Thread(target=_reader, args=(q,), daemon=True).start()
     bot = None
+    group = os.environ.get("MECH_TELEMETRY", "").strip()
+    telemetry = None
+    if group and group != "0":
+        from telemetry import MatchTelemetry
     last: Dict[str, Any] = {}
     errors = 0
     while True:
@@ -520,6 +526,8 @@ def run(make_bot: Any) -> None:
         latest = None
         for raw in batch:
             if raw is None:
+                if telemetry is not None:
+                    telemetry.finish({})
                 return
             try:
                 msg = json.loads(raw)
@@ -532,16 +540,22 @@ def run(make_bot: Any) -> None:
                     bot = make_bot(msg)
                 except Exception:
                     log(traceback.format_exc())
+                if group and group != "0":
+                    telemetry = MatchTelemetry(msg, bot, group)
                 name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
                 _send({"type": "ready", "name": str(name)[:32]})
             elif kind == "obs":
                 latest = msg
             elif kind == "end":
+                if telemetry is not None:
+                    telemetry.finish(msg)
                 return
         if latest is None:
             continue
         action: Dict[str, Any] = {}
         draw.clear()
+        if telemetry is not None:
+            started = time.perf_counter_ns()
         if bot is not None:
             try:
                 action = dict(bot.act(latest) or {})
@@ -560,6 +574,13 @@ def run(make_bot: Any) -> None:
         except (TypeError, ValueError):  # something in the action isn't JSON
             log(f"unserializable action at tick {latest['tick']}:\n{traceback.format_exc()}")
             _send({"tick": latest["tick"], **last})
+        if telemetry is not None:
+            elapsed_ns = time.perf_counter_ns() - started
+            try:
+                telemetry.observe(latest, action, elapsed_ns)
+            except Exception:
+                log("Disabling local telemetry:", traceback.format_exc())
+                telemetry = None
 
 
 if __name__ == "__main__":
