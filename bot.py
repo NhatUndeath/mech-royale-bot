@@ -217,7 +217,7 @@ class Bot:
                         continue
                 if abs(p["pos"][2] - self.nav.ground_h(p["pos"][0], p["pos"][1])) > 3:
                     continue
-                if d2(p["pos"]) < 70:
+                if d2(p["pos"]) < (120 if t < 200 else 70):
                     picks.append(p)
             cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
             if picks:
@@ -232,6 +232,16 @@ class Bot:
             elif cubes:
                 c = min(cubes, key=lambda c: d2(c["pos"]))
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
+            # farm NPC drones (2 cubes) and crates (1 cube + maybe a weapon) while it is quiet
+            if t < 260 and hp_frac > 0.6 and not mechs:
+                npc_c = [n for n in npcs if d2(n["pos"]) < 70]
+                crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
+                          and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
+                if npc_c:
+                    farm_target = dict(min(npc_c, key=lambda n: d2(n["pos"])))
+                elif crates and mode == "zone":
+                    c = min(crates, key=lambda c: d2(c["pos"]))
+                    farm_target = {"kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "id": c["id"]}
         # supply drop: only if very close and nobody around
         if safe and mode == "zone" and not mechs:
             for dr in obs.get("drops") or []:
