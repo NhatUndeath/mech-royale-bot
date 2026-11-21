@@ -16,6 +16,28 @@ import time
 import mechfight as mf
 from nav import Nav
 
+try:
+    import params as P
+except ModuleNotFoundError as exc:
+    if exc.name != "params":
+        raise
+    P = None
+
+
+def opt(name, default):
+    return getattr(P, name, default)
+
+
+# Optional overrides for replay experiments. Defaults use the v4 behavior.
+GATE = opt("GATE", True)
+RETREAT = opt("RETREAT", "v2")
+COVER = opt("COVER", True)
+FARM = opt("FARM", True)
+DODGE = opt("DODGE", False)
+BREAK_LOS = opt("BREAK_LOS", True)
+EDGE = opt("EDGE", None)
+LOOT_EARLY = opt("LOOT_EARLY", 120)
+
 UPGRADE_PREF = ["armor", "plating", "nanites", "servos", "gun_rate", "gun_damage", "laser_charge",
                 "laser_damage", "lightning_range", "mortar_reload", "mortar_splash", "gun_mag",
                 "gun_velocity", "sensors", "gyros", "reactor", "capacitor", "jets", "laser_pierce",
@@ -80,15 +102,16 @@ class Bot:
         if key != self.goal_key or self.goal is None:
             d = math.dist((x, y), nc)
             # Rotate to the near side with room for error; keep shorter routes in small circles.
-            r = (0.72 if nr > 55 else 0.50) * nr
+            edge = EDGE if EDGE is not None else (0.72 if nr > 55 else 0.50)
+            r = edge * nr
             if d <= r:
                 g = (x, y)
             else:
                 ux, uy = norm2(x - nc[0], y - nc[1])
                 g = (nc[0] + ux * r, nc[1] + uy * r)
-            if self.nav.ready and nr > 4:
-                cover_radius = (0.82 if nr > 55 else 0.68) * nr
-                g = self.nav.cover_spot(nc, cover_radius, g, self.rng) or g
+            if COVER and self.nav.ready and nr > 4:
+                cover_edge = (0.82 if nr > 55 else 0.68) if EDGE is None else min(0.95, edge + 0.05)
+                g = self.nav.cover_spot(nc, cover_edge * nr, g, self.rng) or g
             if self.nav.ready:
                 i, j = self.nav.cell(*g)
                 if not self.nav.main[j * self.nav.gx + i]:
@@ -133,7 +156,7 @@ class Bot:
     def escape_spot(self, obs, nearby, zone_goal):
         x, y, _ = obs["self"]["pos"]
         zone = obs["zone"]
-        if not self.nav.ready or not nearby or zone["next_radius"] <= 4:
+        if not BREAK_LOS or not self.nav.ready or not nearby or zone["next_radius"] <= 4:
             return zone_goal
         if obs["t"] >= self.cover_until or self.escape_phase != self.goal_key:
             threats = [m["pos"] for m in nearby[:2]]
@@ -314,8 +337,8 @@ class Bot:
                 s -= 40 * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
                 attacked = m["id"] in self.threat and t - self.threat[m["id"]][0] < 5
                 weak = m.get("hp", 1400) < 0.35 * max(1, m.get("max_hp", 1400))
-                engageable = attacked or d < 60 or (weak and hp_frac > 0.6 and d < 150 and not crowded)
-                return (not engageable, s)
+                selective_target = attacked or d < 60 or (weak and hp_frac > 0.6 and d < 150 and not crowded)
+                return (GATE and not selective_target, s)
             priority, target = min(((score(m), m) for m in mechs), key=lambda row: row[0])
             engage = not priority[0]
         tdist = d2(target["pos"]) if target else 1e9
@@ -327,7 +350,8 @@ class Bot:
 
         # ---------------- farming / looting when safe
         nearest_mech = min((d2(m["pos"]) for m in mechs), default=1e9)
-        wants_cover = crowded or (bool(nearby) and hp_frac < 0.5)
+        retreat_hp = 0.35 if RETREAT == "v1" else 0.50
+        wants_cover = crowded or (bool(nearby) and hp_frac < retreat_hp)
         safe = not (travel or wants_cover) and t >= self.danger_until and nearest_mech > 90 and hp_frac > 0.45
         def affordable_detour(pos):
             zone = obs["zone"]
@@ -352,7 +376,7 @@ class Bot:
                         continue
                 if abs(p["pos"][2] - self.nav.ground_h(p["pos"][0], p["pos"][1])) > 3:
                     continue
-                if d2(p["pos"]) < (120 if t < 200 else 70) and affordable_detour(p["pos"]):
+                if d2(p["pos"]) < (LOOT_EARLY if t < 200 else 70) and affordable_detour(p["pos"]):
                     picks.append(p)
             cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and affordable_detour(c["pos"])
                      and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
@@ -369,7 +393,7 @@ class Bot:
                 c = min(cubes, key=lambda c: d2(c["pos"]))
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
             # farm NPC drones (2 cubes) and crates (1 cube + maybe a weapon) while it is quiet
-            if t < 260 and hp_frac > 0.6 and nearest_mech > 150 and not engage:
+            if FARM and t < 260 and hp_frac > 0.6 and nearest_mech > 150 and not engage:
                 npc_c = [n for n in npcs if d2(n["pos"]) < 70]
                 crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
                           and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
@@ -425,7 +449,8 @@ class Bot:
                 self.strafe_until = t + self.rng.uniform(0.6, 1.6)
             sx, sy = px * self.strafe_sign, py * self.strafe_sign
             their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
-            retreat = hp_frac < 0.5 and their > hp_frac - 0.05
+            retreat_margin = 0.0 if RETREAT == "v1" else 0.05
+            retreat = hp_frac < retreat_hp and their > hp_frac - retreat_margin
             if retreat:
                 ax, ay = -math.cos(ty_), -math.sin(ty_)
                 mv = norm2(ax * 0.7 + sx * 0.5 + mv[0] * 0.6, ay * 0.7 + sy * 0.5 + mv[1] * 0.6)
@@ -436,6 +461,18 @@ class Bot:
                 fx, fy = (math.cos(ty_), math.sin(ty_)) if want_close else (0.0, 0.0)
                 mv = norm2(sx + mv[0] * 0.5 + fx * 0.6, sy + mv[1] * 0.5 + fy * 0.6)
                 mode = "fight"
+        if DODGE and not (travel or seeking_cover):
+            for m in mechs:
+                if not m.get("charging"):
+                    continue
+                bearing = math.atan2(y - m["pos"][1], x - m["pos"][0])
+                if abs(wrap(m["aim"][0] - bearing)) < 0.15:
+                    side = 1 if int(t * 2) % 2 == 0 else -1
+                    mv = norm2(mv[0] - 2 * side * math.sin(bearing), mv[1] + 2 * side * math.cos(bearing))
+                    boost = me["energy"] > 10
+                    mode = "dodge"
+                    break
+
         # NPC avoidance when not farming them
         if not (travel or seeking_cover) and (farm_target is None or farm_target.get("kind") != "npc"):
             for n in npcs:
@@ -512,7 +549,20 @@ class Bot:
         act["fire"] = fire
 
         self.nav.work(max(0.0, min(0.006, 0.009 - (time.perf_counter() - t_start))))
-        mf.draw.label(f"{mode} hp{hp_frac:.0%} {'T' + str(target['id']) if target else ''}")
+        secondary = me["weapons"][1]
+        weapon_name = secondary["kind"] if secondary else "-"
+        mf.draw.label(f"{mode} hp{me['hp']:.0f}/{me['max_hp']:.0f} e{me['energy']:.0f} {weapon_name} "
+                      f"T{target['id'] if target else '-'}@{tdist if target else 0:.0f} "
+                      f"n{len(mechs)} st{self.stuck_t:.1f}")
+        if self.goal:
+            mf.draw.line([x, y, z + 2], [self.goal[0], self.goal[1], z + 2], "#40c0ff")
+        if shoot_at is not None:
+            tx, ty, tz = shoot_at["pos"]
+            mf.draw.line([x, y, z + 7], [tx, ty, tz + 4], "#ff5040")
+        hits = [event for event in obs.get("events") or [] if event["type"] == "damaged"]
+        if hits:
+            mf.draw.text(" ".join(f"{e['weapon']}:{e['amount']:.0f}{'R' if e.get('rear') else ''}<{e.get('by')}"
+                                  for e in hits[:6]))
         return act
 
 
