@@ -16,6 +16,25 @@ import time
 import mechfight as mf
 from nav import Nav
 
+try:
+    import params as P
+except ImportError:
+    P = None
+
+
+def opt(name, default):
+    return getattr(P, name, default) if P is not None else default
+
+
+GATE = opt("GATE", False)            # only fight when attacked / close / finishing a weak target
+RETREAT = opt("RETREAT", "v1")       # v1: hp<35% and losing; v2: hp<50% or crowded
+COVER = opt("COVER", False)          # hold a spot near walls inside the next zone
+FARM = opt("FARM", True)             # shoot NPC drones and crates when quiet
+DODGE = opt("DODGE", False)          # sidestep lasers aimed at us
+BREAK_LOS = opt("BREAK_LOS", False)  # retreat toward a spot the attacker cannot see
+EDGE = opt("EDGE", 0.5)
+LOOT_EARLY = opt("LOOT_EARLY", 70)   # how far to walk for a weapon in the first 200 s              # where to wait inside the next zone, as a fraction of its radius
+
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "laser_damage", "laser_charge",
                 "servos", "gun_mag", "gun_velocity", "sensors", "gyros", "reactor", "capacitor", "jets"]
 WEAPON_PREF = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
@@ -75,14 +94,14 @@ class Bot:
         x, y = me["pos"][0], me["pos"][1]
         if key != self.goal_key or self.goal is None:
             d = math.dist((x, y), nc)
-            r = 0.5 * nr
+            r = EDGE * nr
             if d <= r:
                 g = (x, y)
             else:
                 ux, uy = norm2(x - nc[0], y - nc[1])
                 g = (nc[0] + ux * r, nc[1] + uy * r)
-            if self.nav.ready and nr > 20:
-                g = self.nav.cover_spot(nc, 0.55 * nr, g, self.rng) or g
+            if COVER and self.nav.ready and nr > 20:
+                g = self.nav.cover_spot(nc, (EDGE + 0.05) * nr, g, self.rng) or g
             if self.nav.ready:
                 i, j = self.nav.nearest_free(g[0], g[1], 80, main=True)
                 g = self.nav.center(i, j)
@@ -140,6 +159,24 @@ class Bot:
             return None
         ang = math.atan2(v * v - math.sqrt(disc), g * x2)
         return math.atan2(ty2 - my, tx2 - mx), ang
+
+    def hide_dir(self, x, y, z, enemy):
+        """Direction to the nearest reachable point (within ~25 m) the enemy has no line of sight to."""
+        ex, ey, ez = enemy
+        best = None
+        for k in range(16):
+            a = k * math.pi / 8
+            ca, sa = math.cos(a), math.sin(a)
+            for r in (8, 14, 20, 26):
+                px, py = x + ca * r, y + sa * r
+                if not self.nav.free(px, py):
+                    break
+                if not self.nav.los((ex, ey, ez + 8), (px, py, z + 4.5)):
+                    score = r - 6 * (ca * (x - ex) + sa * (y - ey)) / max(1.0, math.hypot(x - ex, y - ey))
+                    if best is None or score < best[0]:
+                        best = (score, ca, sa)
+                    break
+        return (best[1], best[2]) if best else None
 
     def aligned(self, me, yaw, pitch, dist, tol_r=2.5):
         ay, ap = me["aim"]
@@ -217,7 +254,7 @@ class Bot:
                         continue
                 if abs(p["pos"][2] - self.nav.ground_h(p["pos"][0], p["pos"][1])) > 3:
                     continue
-                if d2(p["pos"]) < (120 if t < 200 else 70):
+                if d2(p["pos"]) < (LOOT_EARLY if t < 200 else 70):
                     picks.append(p)
             cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
             if picks:
@@ -233,7 +270,7 @@ class Bot:
                 c = min(cubes, key=lambda c: d2(c["pos"]))
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
             # farm NPC drones (2 cubes) and crates (1 cube + maybe a weapon) while it is quiet
-            if t < 260 and hp_frac > 0.6 and not mechs:
+            if FARM and t < 260 and hp_frac > 0.6 and not mechs:
                 npc_c = [n for n in npcs if d2(n["pos"]) < 70]
                 crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
                           and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
@@ -269,7 +306,7 @@ class Bot:
         if target is not None:
             their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             attacked = target["id"] in self.threat and t - self.threat[target["id"]][0] < 5
-            engage = attacked or tdist < 60 or (their < 0.35 and hp_frac > 0.6 and tdist < 150)
+            engage = (not GATE) or attacked or tdist < 60 or (their < 0.35 and hp_frac > 0.6 and tdist < 150)
             if not engage and tdist < 180:
                 # stay out of it: move away from them, keep facing them
                 ax, ay = norm2(x - target["pos"][0], y - target["pos"][1])
@@ -286,9 +323,16 @@ class Bot:
             sx, sy = px * self.strafe_sign, py * self.strafe_sign
             their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             crowd = sum(1 for m in mechs if d2(m["pos"]) < 120)
-            retreat = (hp_frac < 0.5 and their > hp_frac - 0.05) or (crowd >= 2 and hp_frac < 0.8)
+            if RETREAT == "v2":
+                retreat = (hp_frac < 0.5 and their > hp_frac - 0.05) or (crowd >= 2 and hp_frac < 0.8)
+            else:
+                retreat = hp_frac < 0.35 and their > hp_frac
             if retreat:
                 ax, ay = -math.cos(ty_), -math.sin(ty_)
+                if BREAK_LOS and self.nav.ready:
+                    hide = self.hide_dir(x, y, z, target["pos"])
+                    if hide:
+                        ax, ay = hide
                 mv = norm2(ax * 0.7 + sx * 0.5 + mv[0] * 0.6, ay * 0.7 + sy * 0.5 + mv[1] * 0.6)
                 boost = me["energy"] > 25
                 mode = "retreat"
@@ -301,6 +345,18 @@ class Bot:
             if self.nav.ready and not self.nav.free(x + mv[0] * 4, y + mv[1] * 4):
                 self.strafe_sign = -self.strafe_sign
                 self.strafe_until = t + 1.0
+        # sidestep a laser being charged at us
+        if DODGE:
+            for m in mechs:
+                if m.get("charging"):
+                    b = math.atan2(y - m["pos"][1], x - m["pos"][0])
+                    if abs(wrap(m["aim"][0] - b)) < 0.15:
+                        px, py = -math.sin(b), math.cos(b)
+                        sgn = 1 if (int(t * 2) % 2 == 0) else -1
+                        mv = norm2(px * sgn * 2 + mv[0], py * sgn * 2 + mv[1])
+                        boost = me["energy"] > 10
+                        mode = "dodge"
+                        break
         # NPC avoidance when not farming them
         if farm_target is None or farm_target.get("kind") != "npc":
             for n in npcs:
@@ -404,7 +460,17 @@ class Bot:
         act["fire"] = fire
 
         self.nav.work(max(0.0, 0.010 - (time.perf_counter() - t_start)))
-        mf.draw.label(f"{mode} hp{hp_frac:.0%} {'T' + str(target['id']) if target else ''}")
+        # debug record (only our team can download it): enough to rebuild why we die
+        w1 = me["weapons"][1]["kind"] if me["weapons"][1] else "-"
+        mf.draw.label(f"{mode} hp{me['hp']:.0f}/{me['max_hp']:.0f} e{me['energy']:.0f} {w1} "
+                      f"T{target['id'] if target else '-'}@{tdist if target else 0:.0f} n{len(mechs)} st{self.stuck_t:.1f}")
+        if self.goal:
+            mf.draw.line([x, y, z + 2], [self.goal[0], self.goal[1], z + 2], "#40c0ff")
+        if shoot_at is not None:
+            mf.draw.line([x, y, z + 7], [shoot_at["pos"][0], shoot_at["pos"][1], shoot_at["pos"][2] + 4], "#ff5040")
+        dmg = [e for e in obs.get("events") or [] if e["type"] == "damaged"]
+        if dmg:
+            mf.draw.text(" ".join(f"{e['weapon']}:{e['amount']:.0f}{'R' if e.get('rear') else ''}<{e.get('by')}" for e in dmg[:6]))
         return act
 
 
