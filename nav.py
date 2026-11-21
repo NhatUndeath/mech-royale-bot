@@ -201,6 +201,30 @@ class Nav:
                         return i, j
         return i0, j0
 
+    def cover_spot(self, center, radius, near, rng, samples=300):
+        """A free cell inside the circle, close to `near`, with walls around it for cover."""
+        gx, raw, main = self.gx, self.raw, self.main
+        best, bp = None, None
+        for _ in range(samples):
+            a = rng.uniform(0, 2 * math.pi)
+            rr = radius * math.sqrt(rng.random())
+            px, py = center[0] + rr * math.cos(a), center[1] + rr * math.sin(a)
+            i, j = self.cell(px, py)
+            if not main[j * gx + i]:
+                continue
+            cover = 0
+            for dj in range(-3, 4):
+                jj = j + dj
+                if 0 <= jj < self.gy:
+                    for di in range(-3, 4):
+                        ii = i + di
+                        if 0 <= ii < gx and raw[jj * gx + ii]:
+                            cover += 1
+            score = math.dist((px, py), near) - 4.0 * min(cover, 12)
+            if best is None or score < best:
+                best, bp = score, self.center(i, j)
+        return bp
+
     def ground_h(self, x, y):
         return self.terrain.height(x, y) if self.terrain else 0.0
 

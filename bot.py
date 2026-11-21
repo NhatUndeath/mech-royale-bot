@@ -81,6 +81,8 @@ class Bot:
             else:
                 ux, uy = norm2(x - nc[0], y - nc[1])
                 g = (nc[0] + ux * r, nc[1] + uy * r)
+            if self.nav.ready and nr > 20:
+                g = self.nav.cover_spot(nc, 0.55 * nr, g, self.rng) or g
             if self.nav.ready:
                 i, j = self.nav.nearest_free(g[0], g[1], 80, main=True)
                 g = self.nav.center(i, j)
@@ -230,15 +232,6 @@ class Bot:
             elif cubes:
                 c = min(cubes, key=lambda c: d2(c["pos"]))
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
-            if t < 260 and hp_frac > 0.6 and not mechs:
-                npc_c = [n for n in npcs if d2(n["pos"]) < 70]
-                crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
-                          and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
-                if npc_c:
-                    farm_target = dict(min(npc_c, key=lambda n: d2(n["pos"])))
-                elif crates and mode == "zone":
-                    c = min(crates, key=lambda c: d2(c["pos"]))
-                    farm_target = {"kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "id": c["id"]}
         # supply drop: only if very close and nobody around
         if safe and mode == "zone" and not mechs:
             for dr in obs.get("drops") or []:
@@ -262,7 +255,18 @@ class Bot:
         boost = not me.get("in_zone", True) or travel and dgoal > 60
 
         # combat movement: strafe / retreat
-        fighting = target is not None and tdist < 160
+        engage = False
+        if target is not None:
+            their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
+            attacked = target["id"] in self.threat and t - self.threat[target["id"]][0] < 5
+            engage = attacked or tdist < 60 or (their < 0.35 and hp_frac > 0.6 and tdist < 150)
+            if not engage and tdist < 180:
+                # stay out of it: move away from them, keep facing them
+                ax, ay = norm2(x - target["pos"][0], y - target["pos"][1])
+                w = (180 - tdist) / 180
+                mv = norm2(mv[0] + ax * w * 1.5, mv[1] + ay * w * 1.5)
+                mode = "avoid"
+        fighting = engage and tdist < 160
         if fighting:
             ty_ = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
             px, py = -math.sin(ty_), math.cos(ty_)
@@ -271,7 +275,8 @@ class Bot:
                 self.strafe_until = t + self.rng.uniform(0.6, 1.6)
             sx, sy = px * self.strafe_sign, py * self.strafe_sign
             their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
-            retreat = hp_frac < 0.35 and their > hp_frac
+            crowd = sum(1 for m in mechs if d2(m["pos"]) < 120)
+            retreat = (hp_frac < 0.5 and their > hp_frac - 0.05) or (crowd >= 2 and hp_frac < 0.8)
             if retreat:
                 ax, ay = -math.cos(ty_), -math.sin(ty_)
                 mv = norm2(ax * 0.7 + sx * 0.5 + mv[0] * 0.6, ay * 0.7 + sy * 0.5 + mv[1] * 0.6)
@@ -290,9 +295,9 @@ class Bot:
         if farm_target is None or farm_target.get("kind") != "npc":
             for n in npcs:
                 dn = d2(n["pos"])
-                if dn < 50:
+                if dn < 70:
                     ax, ay = norm2(x - n["pos"][0], y - n["pos"][1])
-                    w = (50 - dn) / 50
+                    w = 1.5 * (70 - dn) / 70
                     mv = norm2(mv[0] + ax * w, mv[1] + ay * w)
 
         # stuck handling
@@ -322,8 +327,11 @@ class Bot:
         # ---------------- aiming and firing
         fire = [False, False]
         shoot_at = None
-        if target is not None and tdist < 230:
+        if target is not None and engage and tdist < 230:
             shoot_at = target
+        elif target is not None:
+            yaw, pitch, hd = self.lead(me, target, 252)
+            act["aim"] = [yaw, 0.0]
         elif farm_target is not None:
             shoot_at = farm_target
 
@@ -364,7 +372,7 @@ class Bot:
                         act["aim"] = [sol[0], max(-0.69, min(1.29, sol[1]))]
                         if abs(wrap(me["aim"][0] - sol[0])) < 0.03 and abs(me["aim"][1] - sol[1]) < 0.03:
                             fire[i] = True
-        else:
+        elif target is None:
             # no target: look at threats, then sounds, else scan along travel
             look = None
             if self.last_hit_bearing is not None and t - self.last_hit_t < 3:
@@ -385,7 +393,7 @@ class Bot:
             fire[lz[0]] = False
         act["fire"] = fire
 
-        self.nav.work(max(0.0, 0.015 - (time.perf_counter() - t_start)))
+        self.nav.work(max(0.0, 0.010 - (time.perf_counter() - t_start)))
         mf.draw.label(f"{mode} hp{hp_frac:.0%} {'T' + str(target['id']) if target else ''}")
         return act
 
