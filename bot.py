@@ -81,7 +81,7 @@ class Bot:
             else:
                 ux, uy = norm2(x - nc[0], y - nc[1])
                 g = (nc[0] + ux * r, nc[1] + uy * r)
-            if self.nav.ready:
+            if self.nav.ready and (nr > 4 or not self.nav.free(*g)):
                 i, j = self.nav.nearest_free(g[0], g[1], 80, main=True)
                 g = self.nav.center(i, j)
             self.goal, self.goal_key = g, key
@@ -250,9 +250,13 @@ class Bot:
         dgoal = math.dist((x, y), (gx, gy))
         mv = (0.0, 0.0)
         if mode == "zone":
-            if dgoal > 6:
+            stop = min(6.0, max(0.05, 0.10 * obs["zone"]["radius"]))
+            if dgoal > stop:
                 s = self.nav.steer(x, y, (gx, gy))
                 mv = norm2(*(s if s else (gx - x, gy - y)))
+                if travel and obs["zone"]["next_radius"] <= 4 and dgoal < 2:
+                    scale = dgoal / 2
+                    mv = (mv[0] * scale, mv[1] * scale)
         else:
             if dgoal > 1.0:
                 s = None
@@ -262,7 +266,7 @@ class Bot:
         boost = not me.get("in_zone", True) or travel and dgoal > 60
 
         # combat movement: strafe / retreat
-        fighting = target is not None and tdist < 160
+        fighting = not travel and target is not None and tdist < 160
         if fighting:
             ty_ = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
             px, py = -math.sin(ty_), math.cos(ty_)
@@ -287,7 +291,7 @@ class Bot:
                 self.strafe_sign = -self.strafe_sign
                 self.strafe_until = t + 1.0
         # NPC avoidance when not farming them
-        if farm_target is None or farm_target.get("kind") != "npc":
+        if not travel and (farm_target is None or farm_target.get("kind") != "npc"):
             for n in npcs:
                 dn = d2(n["pos"])
                 if dn < 50:
@@ -306,7 +310,8 @@ class Bot:
             self.unstick_dir = (math.cos(ang), math.sin(ang))
             self.unstick_until = t + 0.8
             self.stuck_t = 0.0
-        if t < self.unstick_until:
+        if (t < self.unstick_until and
+                (not travel or self.unstick_dir[0] * mv[0] + self.unstick_dir[1] * mv[1] > 0)):
             mv = self.unstick_dir
             if me.get("grounded") and me["energy"] > 30:
                 act["jump"] = True
