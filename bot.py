@@ -230,9 +230,22 @@ class Bot:
                 engage, retreat, push = shoot, withdraw, advantage
                 break
 
-        # ---------------- farming / looting when safe
-        nearest_mech = min((d2(m["pos"]) for m in mechs), default=1e9)
-        safe = not travel and nearest_mech > 90 and hp_frac > 0.45
+        # A distant contact is compatible with farming, but the detour itself
+        # must also leave room to return before the zone closes.
+        zone = obs["zone"]
+        walk_speed = me["stats"].get("walk_speed", 11.7)
+        nearest_mech = min((distance for distance, _ in contacts), default=1e9)
+        safe = (not travel and target is None and not attackers and not outnumbered
+                and nearest_mech > 90 and hp_frac > 0.45)
+
+        def safe_detour(pos, wait=0):
+            xy = pos[:2]
+            if (math.dist(xy, zone["center"]) > zone["radius"]
+                    or any(math.dist(xy, m["pos"][:2]) < 65 for _, m in contacts)):
+                return False
+            back = math.dist(xy, zone["next_center"]) - 0.75 * zone["next_radius"]
+            return back <= 0 or d2(pos) + back < (zone["shrink_end"] - t - wait) * 0.6 * walk_speed
+
         farm_target = None
         if safe:
             empty = any(w is None for w in me["weapons"])
@@ -247,11 +260,13 @@ class Bot:
                         continue
                 if abs(p["pos"][2] - self.nav.ground_h(p["pos"][0], p["pos"][1])) > 3:
                     continue
-                if d2(p["pos"]) < 70:
+                if d2(p["pos"]) < 70 and safe_detour(p["pos"]):
                     picks.append(p)
-            cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
-            if picks:
-                p = min(picks, key=lambda p: d2(p["pos"]))
+            cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and safe_detour(c["pos"])
+                     and abs(c["pos"][2] - self.nav.ground_h(*c["pos"][:2])) < 3]
+            p = min(picks, key=lambda p: d2(p["pos"]), default=None)
+            c = min(cubes, key=lambda c: d2(c["pos"]), default=None)
+            if p is not None and (c is None or d2(p["pos"]) <= 1.6 * d2(c["pos"])):
                 move_to, mode = (p["pos"][0], p["pos"][1]), "loot"
                 if d2(p["pos"]) < self.cfg["loot"]["pickup_radius"] - 0.3:
                     act["take"] = p["id"]
@@ -259,23 +274,34 @@ class Bot:
                         worst_slot = min((s for k, (s, w) in slots.items() if k != "gun"),
                                          key=lambda s: WEAPON_PREF.get(me["weapons"][s]["kind"], 0))
                         act["drop"] = worst_slot
-            elif cubes:
-                c = min(cubes, key=lambda c: d2(c["pos"]))
+            elif c is not None:
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
-            if t < 260 and hp_frac > 0.6 and not mechs:
-                npc_c = [n for n in npcs if d2(n["pos"]) < 70]
-                crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
-                          and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
-                if npc_c:
-                    farm_target = dict(min(npc_c, key=lambda n: d2(n["pos"])))
-                elif crates and mode == "zone":
-                    c = min(crates, key=lambda c: d2(c["pos"]))
-                    farm_target = {"kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "id": c["id"]}
-        # supply drop: only if very close and nobody around
-        if safe and mode == "zone" and not mechs:
-            for dr in obs.get("drops") or []:
-                if dr["lands_in"] <= 3 and d2(dr["pos"]) < 70 and (dr.get("holder") in (None, me["id"])):
-                    move_to, mode = (dr["pos"][0], dr["pos"][1]), "drop"
+            if mode == "zone":
+                for dr in obs.get("drops") or []:
+                    if (dr["lands_in"] <= 3 and d2(dr["pos"]) < 70 and dr.get("holder") in (None, me["id"])
+                            and safe_detour(dr["pos"], max(dr["lands_in"], 0) + dr["capture_s"] - dr["progress"])):
+                        move_to, mode = tuple(dr["pos"][:2]), "drop"
+                        break
+            _, gun = slots.get("gun", (None, None))
+            if (mode == "zone" and hp_frac > 0.6 and not low_energy and gun
+                    and gun.get("ammo", 1) > 0 and not gun.get("reload", 0)):
+                stats = gun["stats"]
+                seconds_per_hp = stats.get("cooldown", 0.24) / max(1, stats.get("damage", 45))
+                npc_cubes = self.cfg.get("npc", {}).get("cubes", 2)
+                crate_cubes = self.cfg.get("crates", {}).get("cubes", 1)
+                farms = [(n, npc_cubes, 1.0) for n in npcs]
+                farms += [(dict(c, kind="crate"), crate_cubes, 0.0) for c in obs.get("crates") or []]
+                affordable = []
+                for actor, reward, drone_risk in farms:
+                    pos = actor["pos"]
+                    distance = d2(pos)
+                    if (distance < 70 and reward > 0 and safe_detour(pos)
+                            and (actor["kind"] == "npc" or abs(pos[2] - self.nav.ground_h(*pos[:2])) < 3)):
+                        cost = distance / walk_speed + actor.get("hp", 350) * seconds_per_hp + drone_risk
+                        affordable.append((cost / reward, actor))
+                # Crates and drones can be visible but obstructed at muzzle height.
+                farm_target = next((actor for _, actor in sorted(affordable, key=lambda row: row[0])[:2]
+                                    if shot_clear(actor)), None)
 
         # ---------------- movement
         gx, gy = move_to
@@ -308,7 +334,6 @@ class Bot:
                 boost = me["energy"] > 25
                 mode = "retreat"
             else:
-                zone = obs["zone"]
                 want_close = (push and "lightning" in slots and 35 < tdist < 75
                               and math.dist(target["pos"][:2], zone["next_center"]) <= zone["next_radius"])
                 fx, fy = (math.cos(ty_), math.sin(ty_)) if want_close else (0.0, 0.0)
