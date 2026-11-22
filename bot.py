@@ -30,6 +30,12 @@ def norm2(x, y):
     return (x / l, y / l) if l > 1e-6 else (0.0, 0.0)
 
 
+def aim_height(actor):
+    if actor["kind"] == "mech":
+        return 4.5 * (1 + 0.05 * (actor.get("cubes") or 0))
+    return 1.75
+
+
 class Bot:
     name = "survivor"
 
@@ -104,10 +110,7 @@ class Bot:
         mx, my, mz = me["pos"]
         mz += me["stats"].get("muzzle_height", 7)
         tx, ty, tz = tgt["pos"]
-        h = 4.5 if tgt["kind"] == "mech" else 1.75
-        if tgt["kind"] == "mech":
-            h *= 1 + 0.05 * (tgt.get("cubes") or 0)
-        tz += h
+        tz += aim_height(tgt)
         px, py, pz = tx, ty, tz
         if speed is not None:
             vx, vy, vz = tgt.get("vel", [0, 0, 0])
@@ -197,9 +200,11 @@ class Bot:
 
         def shot_clear(actor):
             px, py, pz = actor["pos"]
-            return self.nav.los(muzzle, (px, py, pz + 3))
+            return self.nav.los(muzzle, (px, py, pz + aim_height(actor)))
 
         ranked = []
+        laser = slots.get("laser")
+        laser_full = laser and (laser[1].get("charge") or 0) >= laser[1]["stats"].get("charge", 0.75)
         for distance, m in contacts:
             if distance >= 230:
                 continue
@@ -215,22 +220,34 @@ class Bot:
             )
             attack = (not travel and not (nearby - {m["id"]}) and hp_frac >= 0.60 and not low_energy
                       and ((weak and distance < 180) or (advantage and distance < 160)))
+            if (laser_full and not (defend or attack) and distance < laser[1]["stats"].get("range", 280)
+                    and self.aligned(me, *self.lead(me, m, None), tol_r=2.0)):
+                defend = True
             if defend or attack or (outnumbered and m["id"] in nearby):
                 retreat = outnumbered or low_energy or hp_frac < 0.45 or me["hp"] < 0.70 * enemy_hp
                 rank = (not recent, not defend, distance - 40 * (1 - enemy_hp / enemy_max_hp))
                 ranked.append((rank, m, distance, defend or attack, retreat, attack))
 
+        # Try clear shots before considering a lob at a tracked attacker.
+        ranked.sort(key=lambda row: row[0])
+        scan_deadline = t_start + 0.008
+        selected = next((row for row in ranked if time.perf_counter() < scan_deadline and shot_clear(row[1])), None)
+        mortar_solution = None
+        mortar = slots.get("mortar")
+        if selected is None and mortar and mortar[1].get("cooldown", 0) <= 0.1:
+            for row in ranked:
+                _, m, distance, _, _, _ = row
+                if m["id"] in attackers and 25 < distance < 220:
+                    mortar_solution = self.mortar_aim(me, m, mortar[1]["stats"])
+                    if mortar_solution:
+                        selected = row
+                        break
+
         target = None
         tdist = 1e9
         engage = retreat = push = False
-        mortar = slots.get("mortar")
-        for _, m, distance, shoot, withdraw, advantage in sorted(ranked, key=lambda row: row[0])[:3]:
-            # A ready mortar can still lob at a recent attacker without a direct ray.
-            indirect = m["id"] in attackers and mortar and 25 < distance < 220 and mortar[1].get("cooldown", 0) <= 0.1
-            if shot_clear(m) or indirect:
-                target, tdist = m, distance
-                engage, retreat, push = shoot, withdraw, advantage
-                break
+        if selected:
+            _, target, tdist, engage, retreat, push = selected
 
         # A distant contact is compatible with farming, but the detour itself
         # must also leave room to return before the zone closes.
@@ -297,9 +314,10 @@ class Bot:
                 for actor, reward, drone_risk in farms:
                     pos = actor["pos"]
                     distance = d2(pos)
-                    if (distance < 70 and reward > 0 and safe_detour(pos)
+                    kill_seconds = actor.get("hp", 350) * seconds_per_hp
+                    if (distance < 70 and reward > 0 and safe_detour(pos, kill_seconds)
                             and (actor["kind"] == "npc" or abs(pos[2] - self.nav.ground_h(*pos[:2])) < 3)):
-                        cost = distance / walk_speed + actor.get("hp", 350) * seconds_per_hp + drone_risk
+                        cost = distance / walk_speed + kill_seconds + drone_risk
                         affordable.append((cost / reward, actor))
                 # Crates and drones can be visible but obstructed at muzzle height.
                 farm_target = next((actor for _, actor in sorted(affordable, key=lambda row: row[0])[:2]
@@ -322,7 +340,9 @@ class Bot:
         boost = not me.get("in_zone", True) or travel and dgoal > 60
 
         # combat movement: strafe / retreat
-        fighting = target is not None and me.get("in_zone", True) and (tdist < 160 or retreat)
+        rotating_to_zone = travel and mv != (0.0, 0.0)
+        fighting = (not rotating_to_zone and target is not None and me.get("in_zone", True)
+                    and (tdist < 160 or retreat))
         if fighting:
             ty_ = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
             px, py = -math.sin(ty_), math.cos(ty_)
@@ -346,7 +366,7 @@ class Bot:
                 self.strafe_sign = -self.strafe_sign
                 self.strafe_until = t + 1.0
         # NPC avoidance when not farming them
-        if farm_target is None or farm_target.get("kind") != "npc":
+        if not rotating_to_zone and (farm_target is None or farm_target.get("kind") != "npc"):
             for n in npcs:
                 dn = d2(n["pos"])
                 if dn < 50:
@@ -388,20 +408,20 @@ class Bot:
             yaw, pitch, hd = self.lead(me, shoot_at, gspeed)
             act["aim"] = [yaw, max(-0.69, min(1.29, pitch))]
             aligned = self.aligned(me, yaw, pitch, hd, 2.0 if shoot_at.get("kind") == "mech" else 1.4)
-            clear = hd < 230 and shot_clear(shoot_at)
+            direct_clear = shot_clear(shoot_at)
+            clear = hd < 230 and direct_clear
             if gun and aligned and clear and hd < gun[1]["stats"].get("range", 230):
                 if gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 1) > 0:
                     fire[gun[0]] = True
-            lz = slots.get("laser")
             beam_priority = False
-            if lz:
-                i, w = lz
+            if laser:
+                i, w = laser
                 full = w["stats"].get("charge", 0.75)
                 ch = w.get("charge", 0) or 0
-                if (shoot_at["kind"] == "mech" and d2(shoot_at["pos"]) < w["stats"].get("range", 280)
+                if (shoot_at["kind"] == "mech" and direct_clear and tdist < w["stats"].get("range", 280)
                         and w.get("cooldown", 0) <= 0.05):
                     release = False
-                    if ch >= full and shot_clear(shoot_at):
+                    if ch >= full:
                         # Let go along the actual torso aim once it is on the target.
                         beam_priority = True
                         beam_yaw, beam_pitch, beam_dist = self.lead(me, shoot_at, None)
@@ -417,9 +437,9 @@ class Bot:
                         and me["energy"] > 10 and clear:
                     fire[i] = True
             mo = slots.get("mortar")
-            if mo and not beam_priority and shoot_at.get("kind") == "mech" and 25 < hd < 220:
+            if mo and not beam_priority and shoot_at.get("kind") == "mech" and 25 < tdist < 220:
                 i, w = mo
-                sol = self.mortar_aim(me, shoot_at, w["stats"])
+                sol = mortar_solution or self.mortar_aim(me, shoot_at, w["stats"])
                 if sol:
                     if w.get("cooldown", 0) <= 0.1:
                         act["aim"] = [sol[0], max(-0.69, min(1.29, sol[1]))]
