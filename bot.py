@@ -231,7 +231,16 @@ class Bot:
         # Try clear shots before considering a lob at a tracked attacker.
         ranked.sort(key=lambda row: row[0])
         scan_deadline = t_start + 0.008
-        selected = next((row for row in ranked if time.perf_counter() < scan_deadline and shot_clear(row[1])), None)
+        selected = movement_target = None
+        for row in ranked:
+            if time.perf_counter() >= scan_deadline:
+                break
+            _, enemy, _, shoot, _, _ = row
+            if (shoot or movement_target is None) and shot_clear(enemy):
+                if shoot:
+                    selected = row
+                    break
+                movement_target = row
         mortar_solution = None
         mortar = slots.get("mortar")
         if selected is None and mortar and mortar[1].get("cooldown", 0) <= 0.1:
@@ -242,6 +251,7 @@ class Bot:
                     if mortar_solution:
                         selected = row
                         break
+        selected = selected or movement_target
 
         target = None
         tdist = 1e9
