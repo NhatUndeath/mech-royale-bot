@@ -108,12 +108,14 @@ class Bot:
         if tgt["kind"] == "mech":
             h *= 1 + 0.05 * (tgt.get("cubes") or 0)
         tz += h
-        vx, vy, vz = tgt.get("vel", [0, 0, 0])
-        t = 0.0
-        for _ in range(3):
-            px, py, pz = tx + vx * t, ty + vy * t, tz + (vz * t if abs(vz) < 3 else 0)
-            d = math.dist((mx, my, mz), (px, py, pz))
-            t = d / speed + 0.05
+        px, py, pz = tx, ty, tz
+        if speed is not None:
+            vx, vy, vz = tgt.get("vel", [0, 0, 0])
+            t = 0.0
+            for _ in range(3):
+                px, py, pz = tx + vx * t, ty + vy * t, tz + (vz * t if abs(vz) < 3 else 0)
+                d = math.dist((mx, my, mz), (px, py, pz))
+                t = d / speed + 0.05
         yaw = math.atan2(py - my, px - mx)
         pitch = math.atan2(pz - mz, math.hypot(px - mx, py - my))
         return yaw, pitch, math.hypot(px - mx, py - my)
@@ -391,15 +393,23 @@ class Bot:
                 if gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 1) > 0:
                     fire[gun[0]] = True
             lz = slots.get("laser")
+            beam_priority = False
             if lz:
                 i, w = lz
                 full = w["stats"].get("charge", 0.75)
                 ch = w.get("charge", 0) or 0
-                if shoot_at.get("kind") == "mech" and hd < w["stats"].get("range", 280) and w.get("cooldown", 0) <= 0.05:
-                    if ch < full or not (aligned and clear):
-                        fire[i] = ch < full + 1.5   # keep charging, release before auto-fire
-                    else:
-                        fire[i] = False             # release = fire
+                if (shoot_at["kind"] == "mech" and d2(shoot_at["pos"]) < w["stats"].get("range", 280)
+                        and w.get("cooldown", 0) <= 0.05):
+                    release = False
+                    if ch >= full and shot_clear(shoot_at):
+                        # Let go along the actual torso aim once it is on the target.
+                        beam_priority = True
+                        beam_yaw, beam_pitch, beam_dist = self.lead(me, shoot_at, None)
+                        act["aim"] = [beam_yaw, max(-0.69, min(1.29, beam_pitch))]
+                        release = self.aligned(me, beam_yaw, beam_pitch, beam_dist, 2.0)
+                        if gun and fire[gun[0]] and not self.aligned(act, yaw, pitch, hd, 2.0):
+                            fire[gun[0]] = False
+                    fire[i] = not release and ch < full + 1.5
             lt = slots.get("lightning")
             if lt:
                 i, w = lt
@@ -407,7 +417,7 @@ class Bot:
                         and me["energy"] > 10 and clear:
                     fire[i] = True
             mo = slots.get("mortar")
-            if mo and shoot_at.get("kind") == "mech" and 25 < hd < 220:
+            if mo and not beam_priority and shoot_at.get("kind") == "mech" and 25 < hd < 220:
                 i, w = mo
                 sol = self.mortar_aim(me, shoot_at, w["stats"])
                 if sol:
