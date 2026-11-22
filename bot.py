@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import time
+from typing import NamedTuple
 
 import mechfight as mf
 from nav import Nav
@@ -19,6 +20,21 @@ from nav import Nav
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "laser_damage", "laser_charge",
                 "servos", "gun_mag", "gun_velocity", "sensors", "gyros", "reactor", "capacitor", "jets"]
 WEAPON_PREF = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
+COMBAT_BUDGET_S = 0.009
+
+
+class Shot(NamedTuple):
+    kind: str
+    slot: int
+    aim: tuple[float, float]
+    tolerance: tuple[float, float]
+    ready_in: float
+    impact_in: float
+    finish_in: float
+
+    def aligned(self, aim):
+        return (abs(wrap(aim[0] - self.aim[0])) < self.tolerance[0]
+                and abs(aim[1] - self.aim[1]) < self.tolerance[1])
 
 
 def wrap(a):
@@ -58,7 +74,11 @@ class Bot:
         self.scan_yaw = 0.0
         self.sound_look = None    # (until, bearing)
         self.prev_t = 0.0
-        self.laser_hold = 0.0
+        self.combat_target = None
+        self.cover_goal = None
+        self.retreat_until = -1.0
+        self.recover_until = -1.0
+        self.laser_started = None
 
     # ------------------------------------------------------------------ helpers
     def weapon_slots(self, me):
@@ -134,15 +154,254 @@ class Bot:
         tx2, ty2 = tx + vx * tof, ty + vy * tof
         x2 = math.hypot(tx2 - mx, ty2 - my)
         disc = v ** 4 - g * (g * x2 * x2 + 2 * yv * v * v)
-        if disc < 0:
+        if disc < 0 or x2 < 1:
             return None
         ang = math.atan2(v * v - math.sqrt(disc), g * x2)
-        return math.atan2(ty2 - my, tx2 - mx), ang
+        return math.atan2(ty2 - my, tx2 - mx), ang, x2 / (v * math.cos(ang))
 
     def aligned(self, me, yaw, pitch, dist, tol_r=2.5):
         ay, ap = me["aim"]
         tol = math.atan2(tol_r, max(dist, 1.0)) + 0.01
         return abs(wrap(ay - yaw)) < tol and abs(ap - pitch) < tol + 0.03
+
+    def mortar_clear(self, me, aim, flight, stats):
+        """Check the low arc against solid cover and terrain before taking the shot."""
+        x, y, z = me["pos"]
+        yaw, pitch = aim
+        speed, gravity = stats.get("speed", 72), stats.get("gravity", 22)
+        vx = speed * math.cos(pitch) * math.cos(yaw)
+        vy = speed * math.cos(pitch) * math.sin(yaw)
+        vz = speed * math.sin(pitch)
+        start = (x, y, z + me["stats"].get("height", 9) + 0.5)
+        steps = max(3, math.ceil(flight / 0.16))
+        a = start
+        for i in range(1, steps + 1):
+            dt = flight * i / steps
+            b = (x + vx * dt, y + vy * dt, start[2] + vz * dt - 0.5 * gravity * dt * dt)
+            if not self.nav.combat_los(a, b):
+                return False
+            a = b
+        return True
+
+    def shots(self, me, target, slots, distance, allow_charge, deadline):
+        x, y, z = me["pos"]
+        tx, ty, tz = target["pos"]
+        size = 1 + self.cfg.get("cubes", {}).get("size_per_cube", 0.05) * (target.get("cubes") or 0)
+        muzzle = (x, y, z + me["stats"].get("muzzle_height", 7))
+        center = (tx, ty, tz + 4.5 * size)
+        yaw = math.atan2(ty - y, tx - x)
+        pitch = math.atan2(center[2] - muzzle[2], distance)
+        stats = me["stats"]
+        min_pitch = stats.get("min_pitch", -0.69)
+        max_pitch = stats.get("max_pitch", 1.29)
+        target_hp = target.get("hp", target.get("max_hp", 1400))
+        scale = 1 + self.cfg.get("cubes", {}).get("damage_per_cube", 0.04) * min(
+            me.get("cubes", 0), self.cfg.get("cubes", {}).get("stat_cap", 10))
+        plans = []
+        direct = None
+        for kind, (slot, w) in slots.items():
+            if time.perf_counter() >= deadline:
+                break
+            if kind == "laser" and not allow_charge and not w.get("charge"):
+                continue
+            ws = w["stats"]
+            ready = w.get("cooldown", 0)
+            flight = charge = reloads = 0.0
+            aim = (yaw, pitch)
+            tolerance = math.atan2(2 * size, max(distance, 1.0)) + 0.01
+            yaw_tol, pitch_tol = tolerance, tolerance + 0.03
+            damage = ws.get("damage", 45) * scale
+            interval = ws.get("cooldown", 0.25)
+            count = math.ceil(target_hp / max(1, damage))
+            if kind == "gun":
+                speed = ws.get("speed", 252)
+                ay, ap, hd = self.lead(me, target, speed)
+                if hd >= ws.get("range", 230):
+                    continue
+                end = (x + math.cos(ay) * hd, y + math.sin(ay) * hd, muzzle[2] + math.tan(ap) * hd)
+                if not self.nav.combat_los(muzzle, end):
+                    continue
+                aim = (ay, ap)
+                flight = math.dist(muzzle, end) / speed
+                ammo, mag = w.get("ammo", ws.get("mag", 12)), max(1, ws.get("mag", 12))
+                reload = ws.get("reload", 2.4)
+                ready = max(ready, w.get("reload", 0), reload if ammo <= 0 and not w.get("reload") else 0)
+                available = mag if ammo <= 0 or w.get("reload", 0) > 0 else ammo
+                reloads = math.ceil(max(0, count - available) / mag) * reload
+            elif kind == "mortar":
+                if not 25 < distance < 220:
+                    continue
+                sol = self.mortar_aim(me, target, ws)
+                if sol is None or not min_pitch <= sol[1] <= max_pitch:
+                    continue
+                aim, flight = sol[:2], sol[2]
+                if not self.mortar_clear(me, aim, flight, ws):
+                    continue
+                yaw_tol = pitch_tol = 0.03
+            elif kind in ("laser", "lightning"):
+                if math.dist(muzzle, center) >= ws.get("range", 280 if kind == "laser" else 45):
+                    continue
+                if direct is None:
+                    direct = self.nav.combat_los(muzzle, center)
+                if not direct:
+                    continue
+                if kind == "laser":
+                    full = ws.get("charge", 0.75)
+                    charge = max(0, full - (w.get("charge") or 0))
+                    interval += full
+                else:
+                    if me["energy"] < max(10, ws.get("energy", 3)):
+                        continue
+                    yaw_tol = math.radians(ws.get("cone_deg", 30)) * 0.45
+                    pitch_tol = math.inf
+                    aim = (yaw, max(min_pitch, min(max_pitch, pitch)))
+            else:
+                continue
+            if not min_pitch <= aim[1] <= max_pitch:
+                continue
+            slew = max(abs(wrap(aim[0] - me["aim"][0])) / stats.get("turn_rate", 4),
+                       abs(aim[1] - me["aim"][1]) / stats.get("pitch_rate", 4))
+            impact = max(ready + charge, slew) + flight
+            plans.append(Shot(kind, slot, aim, (yaw_tol, pitch_tol), ready,
+                              impact, impact + max(0, count - 1) * interval + reloads))
+        return plans
+
+    def choose_target(self, me, mechs, slots, t, allow_charge, deadline):
+        """Choose among feasible shot plans. A blocked contact still matters to movement."""
+        x, y = me["pos"][:2]
+        best, best_score = (None, math.inf, []), -1.0
+        for target in sorted(mechs, key=lambda m: math.hypot(m["pos"][0] - x, m["pos"][1] - y)):
+            if time.perf_counter() >= deadline:
+                break
+            distance = math.hypot(target["pos"][0] - x, target["pos"][1] - y)
+            plans = self.shots(me, target, slots, distance, allow_charge, deadline)
+            if not plans:
+                continue
+            incoming = self.threat.get(target["id"])
+            threat = max(0.0, 1 - (t - incoming[0]) / 3.0) if incoming else 0.0
+            finish = max(0.0, 1 - min(p.finish_in for p in plans) / 4)
+            ready = max(0.0, 1 - min(p.impact_in for p in plans) / 2.0)
+            near = max(0.0, 1 - distance / 280)
+            score = 0.35 * threat + 0.30 * finish + 0.20 * ready + 0.15 * near
+            if target["id"] == self.combat_target:
+                score += 0.05
+            if score > best_score:
+                best, best_score = (target, distance, plans), score
+        self.combat_target = best[0]["id"] if best[0] else None
+        return best
+
+    def firing_angles(self, me, mechs, t, deadline):
+        """Return distinct attackers with fresh damage or a plausible current firing line."""
+        x, y, z = me["pos"]
+        center = (x, y, z + me["stats"].get("height", 9) * 0.5)
+        angles = []
+        seen = set()
+        for enemy in mechs:
+            eid = enemy["id"]
+            seen.add(eid)
+            tx, ty, tz = enemy["pos"]
+            dist = math.hypot(tx - x, ty - y)
+            bearing = math.atan2(ty - y, tx - x)
+            hit = self.threat.get(eid)
+            recent = hit is not None and t - hit[0] < 1.2
+            facing = abs(wrap(enemy.get("aim", (bearing, 0))[0] - bearing - math.pi)) < 0.50
+            weapons = enemy.get("weapons", ("gun",))
+            in_range = any(kind != "lightning" or dist <= self.cfg["weapons"]["lightning"]["range"]
+                           for kind in weapons)
+            if recent or (dist < 145 and facing and in_range):
+                muzzle = (tx, ty, tz + 7 * (1 + 0.05 * (enemy.get("cubes") or 0)))
+                if time.perf_counter() < deadline and self.nav.combat_los(muzzle, center):
+                    angles.append((bearing, muzzle))
+                elif recent and (hit[2] == "mortar" or t - hit[0] < 0.20):
+                    angles.append((hit[1], None))
+        for eid, (when, bearing, _) in self.threat.items():
+            if 0 <= eid <= 15 and eid not in seen and t - when < 1.2:
+                angles.append((bearing, None))
+        return angles
+
+    def recovery_cover(self, me, mechs, deadline):
+        """Return None when exposed, True under cover, or False with safe separation."""
+        x, y, z = me["pos"]
+        top = (x, y, z + me["stats"].get("height", 9) * 0.85)
+        covered = False
+        for enemy in mechs:
+            tx, ty, tz = enemy["pos"]
+            if math.hypot(tx - x, ty - y) > 160 or not enemy.get("weapons", ("gun",)):
+                continue
+            muzzle = (tx, ty, tz + 7 * (1 + 0.05 * (enemy.get("cubes") or 0)))
+            if time.perf_counter() >= deadline or self.nav.combat_los(muzzle, top):
+                return None
+            covered = True
+        return covered
+
+    def cover_direction(self, obs, me, angles, away, deadline):
+        """Find a short walk that breaks known firing lines without replacing the flow field."""
+        if not me.get("grounded") or any(origin is None for _, origin in angles):
+            return None
+        x, y = me["pos"][:2]
+        ax, ay = away
+        if away == (0.0, 0.0):
+            ax, ay = -math.cos(angles[0][0]), -math.sin(angles[0][0])
+        zone = obs["zone"]
+        candidates = [self.cover_goal] if self.cover_goal else []
+        for distance in (12, 20):
+            candidates.extend((x + dx * distance, y + dy * distance) for dx, dy in (
+                (-ay, ax), (ay, -ax), (ax, ay), norm2(ax - ay, ay + ax), norm2(ax + ay, ay - ax)))
+        for cx, cy in candidates:
+            if time.perf_counter() >= deadline:
+                break
+            distance = math.hypot(cx - x, cy - y)
+            if not 2 < distance <= 24 or math.dist((cx, cy), zone["center"]) >= zone["radius"] - 2:
+                continue
+            if (obs["t"] >= zone["shrink_start"]
+                    and math.dist((cx, cy), zone["next_center"]) > max(
+                        zone["next_radius"] - 2, math.dist((x, y), zone["next_center"]))):
+                continue
+            steps = math.ceil(distance / 2)
+            if any(not self.nav.free(x + (cx - x) * i / steps, y + (cy - y) * i / steps)
+                   for i in range(1, steps + 1)):
+                continue
+            behind = (cx, cy, self.nav.ground_h(cx, cy) + me["stats"].get("height", 9) * 0.75)
+            if all(time.perf_counter() < deadline and not self.nav.combat_los(origin, behind)
+                   for _, origin in angles):
+                self.cover_goal = (cx, cy)
+                return norm2(cx - x, cy - y)
+        self.cover_goal = None
+        return None
+
+    def combat_fire(self, act, me, slots, plans, allow_charge, t):
+        """Choose the shared torso command first, then gate every trigger against it."""
+        fire = [False, False]
+        laser = slots.get("laser")
+        charge = (laser[1].get("charge") or 0) if laser else 0
+        beam = next((p for p in plans if p.kind == "laser"), None)
+        if charge:
+            if beam is None:
+                act["aim"] = list(me["aim"])
+                return fire
+            plan = beam
+        else:
+            plan = min((p for p in plans if allow_charge or p.kind != "laser"),
+                       key=lambda p: p.impact_in + 0.35 * min(p.finish_in, 4), default=None)
+        if plan is None:
+            return fire
+        act["aim"] = list(plan.aim)
+        if plan.kind == "laser":
+            ws = laser[1]["stats"]
+            full = ws.get("charge", 0.75)
+            if self.laser_started is None:
+                self.laser_started = t - charge
+            aligned = plan.aligned(me["aim"])
+            hold = (allow_charge and plan.ready_in <= 0.05
+                    and (aligned or charge > 0 or plan.impact_in <= full + 0.15)
+                    and (charge < full or not aligned)
+                    and t - self.laser_started < full + min(0.4, ws.get("hold_s", 2)))
+            fire[plan.slot] = hold
+        for other in plans:
+            if (other.kind != "laser" and other.ready_in <= 0.10
+                    and other.aligned(plan.aim) and other.aligned(me["aim"])):
+                fire[other.slot] = True
+        return fire
 
     # ------------------------------------------------------------------ main
     def act(self, obs):
@@ -165,9 +424,15 @@ class Bot:
 
         # threats from events and sounds
         for ev in obs.get("events") or []:
-            if ev["type"] == "damaged" and ev.get("by") is not None and ev.get("bearing") is not None:
-                self.threat[ev["by"]] = (t, ev["bearing"])
+            if (ev["type"] == "damaged" and ev.get("by") not in (None, me["id"])
+                    and ev.get("bearing") is not None):
+                self.threat[ev["by"]] = (t, ev["bearing"], ev.get("weapon"))
                 self.last_hit_t, self.last_hit_bearing = t, ev["bearing"]
+            elif ev["type"] == "kill":
+                self.threat.pop(ev.get("target"), None)
+            if (ev["type"] in ("damaged", "hit") and t < self.recover_until
+                    and hp_frac < 0.9):
+                self.recover_until = t + self.cfg["mech"].get("regen_delay", 5) + 1.5
         for s in obs.get("sounds") or []:
             if s["kind"] in ("gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet") and s["dist"] == "near":
                 if self.sound_look is None or self.sound_look[0] < t:
@@ -176,24 +441,26 @@ class Bot:
         mechs = [m for m in obs.get("mechs") or [] if m["kind"] == "mech"]
         npcs = [m for m in obs.get("mechs") or [] if m["kind"] == "npc"]
         slots = self.weapon_slots(me)
+        laser = slots.get("laser")
+        charging = bool(laser and laser[1].get("charge"))
+        if not charging:
+            self.laser_started = None
 
         def d2(p):
             return math.dist((x, y), (p[0], p[1]))
 
-        # ---------------- target choice
-        target = None
-        if mechs:
-            def score(m):
-                d = d2(m["pos"])
-                s = d
-                if m["id"] in self.threat and t - self.threat[m["id"]][0] < 4:
-                    s -= 60
-                s -= 40 * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
-                return s
-            target = min(mechs, key=score)
-        tdist = d2(target["pos"]) if target else 1e9
-
+        # Keep the pressure that controls our legs independent of the selected shot.
         travel = self.must_travel(obs, me)
+        zone = obs["zone"]
+        urgent = travel and (not me.get("in_zone", True)
+                             or d2(zone["next_center"]) > zone["next_radius"] - 2)
+        angles = self.firing_angles(me, mechs, t, t_start + 0.003)
+        crossfire = any(abs(wrap(a - b)) >= 0.55 for i, (a, _) in enumerate(angles)
+                        for b, _ in angles[i + 1:])
+        vulnerable = bool(angles) and (hp_frac < 0.53 or (hp_frac < 0.75 and me["energy"] < 12))
+        allow_charge = not (urgent or crossfire or vulnerable or hp_frac < 0.35
+                            or (angles and t < self.retreat_until))
+        target, tdist, plans = self.choose_target(me, mechs, slots, t, allow_charge, t_start + 0.006)
         goal = self.zone_goal(obs, me)
         mode = "zone"
         move_to = goal
@@ -261,33 +528,71 @@ class Bot:
                 mv = norm2(gx - x, gy - y)
         boost = not me.get("in_zone", True) or travel and dgoal > 60
 
-        # combat movement: strafe / retreat
-        fighting = target is not None and tdist < 160
-        if fighting:
-            ty_ = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
-            px, py = -math.sin(ty_), math.cos(ty_)
-            if t > self.strafe_until:
-                self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.7 else self.strafe_sign
-                self.strafe_until = t + self.rng.uniform(0.6, 1.6)
-            sx, sy = px * self.strafe_sign, py * self.strafe_sign
-            their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
-            retreat = hp_frac < 0.35 and their > hp_frac
+        # Briefly commit to exits and shots, with immediate interrupts for zone and crossfire.
+        duel = target is not None and tdist < 160
+        finish = min((p.finish_in for p in plans), default=math.inf) < 1.4
+        danger = crossfire or (not finish and (vulnerable or (duel and hp_frac < 0.35)))
+        if danger:
+            self.retreat_until = t + 0.55
+            if hp_frac < 0.9:
+                self.recover_until = t + self.cfg["mech"].get("regen_delay", 5) + 1.5
+        retreat = bool(danger or (angles and t < self.retreat_until))
+        recovery = None
+        if (not urgent and not retreat and not angles and hp_frac < 0.9
+                and t < self.recover_until and me.get("grounded")):
+            recovery = self.recovery_cover(me, mechs, t_start + COMBAT_BUDGET_S)
+        recover = recovery is not None
+        cover_move = None
+        if recover:
+            mode = "recover"
+            if recovery:
+                mv, boost = (0.0, 0.0), False
+        elif not urgent and (retreat or duel):
+            cover_angles = angles
+            if not cover_angles:
+                tx, ty, tz = target["pos"]
+                cover_angles = [(math.atan2(ty - y, tx - x), (tx, ty, tz + 7))]
+            ax, ay = norm2(-sum(math.cos(a) for a, _ in cover_angles),
+                           -sum(math.sin(a) for a, _ in cover_angles))
+            cover_move = self.cover_direction(obs, me, cover_angles, (ax, ay),
+                                              t_start + COMBAT_BUDGET_S)
             if retreat:
-                ax, ay = -math.cos(ty_), -math.sin(ty_)
-                mv = norm2(ax * 0.7 + sx * 0.5 + mv[0] * 0.6, ay * 0.7 + sy * 0.5 + mv[1] * 0.6)
-                boost = me["energy"] > 25
+                if (ax, ay) == (0.0, 0.0):
+                    bearing = cover_angles[0][0]
+                    ax, ay = -math.sin(bearing), math.cos(bearing)
+                mv = cover_move or norm2(ax + mv[0] * 0.35, ay + mv[1] * 0.35)
+                boost = bool(angles) and me.get("grounded") and me["energy"] > 25
                 mode = "retreat"
             else:
-                want_close = "lightning" in slots and tdist > 35
-                fx, fy = (math.cos(ty_), math.sin(ty_)) if want_close else (0.0, 0.0)
-                mv = norm2(sx + mv[0] * 0.5 + fx * 0.6, sy + mv[1] * 0.5 + fy * 0.6)
+                tyaw = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
+                px, py = -math.sin(tyaw), math.cos(tyaw)
+                if t > self.strafe_until:
+                    self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.7 else self.strafe_sign
+                    self.strafe_until = t + self.rng.uniform(0.6, 1.6)
+                sx, sy = px * self.strafe_sign, py * self.strafe_sign
+                if cover_move and sx * cover_move[0] + sy * cover_move[1] < 0:
+                    sx, sy = -sx, -sy
+                # Close on lightning range only with an exit and enough energy for it.
+                want_close = ("lightning" in slots and 35 < tdist < 55 and cover_move
+                              and me["energy"] > 30)
+                fx, fy = (math.cos(tyaw), math.sin(tyaw)) if want_close else (0.0, 0.0)
+                base = mv
+                mv = norm2(sx + base[0] * 0.5 + fx * 0.6, sy + base[1] * 0.5 + fy * 0.6)
+                if not self.nav.free(x + mv[0] * 4, y + mv[1] * 4):
+                    self.strafe_sign = -self.strafe_sign
+                    self.strafe_until = t + 1.0
+                    if cover_move:
+                        mv = cover_move
+                    elif self.nav.free(x - sx * 4, y - sy * 4):
+                        mv = (-sx, -sy)
+                    else:
+                        mv = base
                 mode = "fight"
-            # do not strafe into walls
-            if self.nav.ready and not self.nav.free(x + mv[0] * 4, y + mv[1] * 4):
-                self.strafe_sign = -self.strafe_sign
-                self.strafe_until = t + 1.0
+        else:
+            self.cover_goal = None
+        fighting = mode == "fight"
         # NPC avoidance when not farming them
-        if farm_target is None or farm_target.get("kind") != "npc":
+        if not recovery and (farm_target is None or farm_target.get("kind") != "npc"):
             for n in npcs:
                 dn = d2(n["pos"])
                 if dn < 50:
@@ -306,7 +611,7 @@ class Bot:
             self.unstick_dir = (math.cos(ang), math.sin(ang))
             self.unstick_until = t + 0.8
             self.stuck_t = 0.0
-        if t < self.unstick_until:
+        if t < self.unstick_until and not (recovery or cover_move or (urgent and (duel or angles))):
             mv = self.unstick_dir
             if me.get("grounded") and me["energy"] > 30:
                 act["jump"] = True
@@ -321,50 +626,29 @@ class Bot:
 
         # ---------------- aiming and firing
         fire = [False, False]
-        shoot_at = None
-        if target is not None and tdist < 230:
-            shoot_at = target
-        elif farm_target is not None:
-            shoot_at = farm_target
+        shoot_at = farm_target if target is None and not (recover or charging) else None
+        if not recover and (target is not None or charging):
+            fire = self.combat_fire(act, me, slots, plans, allow_charge, t)
 
         if shoot_at is not None:
             gun = slots.get("gun")
             gspeed = gun[1]["stats"]["speed"] if gun else 252
             yaw, pitch, hd = self.lead(me, shoot_at, gspeed)
             act["aim"] = [yaw, max(-0.69, min(1.29, pitch))]
-            aligned = self.aligned(me, yaw, pitch, hd, 2.0 if shoot_at.get("kind") == "mech" else 1.4)
+            aligned = self.aligned(me, yaw, pitch, hd, 1.4)
             eye = (x, y, z + me["stats"].get("muzzle_height", 7))
             tp = (shoot_at["pos"][0], shoot_at["pos"][1], shoot_at["pos"][2] + 3)
             clear = self.nav.los(eye, tp) if hd < 230 else False
             if gun and aligned and clear and hd < gun[1]["stats"].get("range", 230):
                 if gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 1) > 0:
                     fire[gun[0]] = True
-            lz = slots.get("laser")
-            if lz:
-                i, w = lz
-                full = w["stats"].get("charge", 0.75)
-                ch = w.get("charge", 0) or 0
-                if shoot_at.get("kind") == "mech" and hd < w["stats"].get("range", 280) and w.get("cooldown", 0) <= 0.05:
-                    if ch < full or not (aligned and clear):
-                        fire[i] = ch < full + 1.5   # keep charging, release before auto-fire
-                    else:
-                        fire[i] = False             # release = fire
             lt = slots.get("lightning")
             if lt:
                 i, w = lt
                 if hd < w["stats"].get("range", 45) * 0.95 and abs(wrap(me["aim"][0] - yaw)) < math.radians(w["stats"].get("cone_deg", 30)) * 0.45 \
                         and me["energy"] > 10 and clear:
                     fire[i] = True
-            mo = slots.get("mortar")
-            if mo and shoot_at.get("kind") == "mech" and 25 < hd < 220:
-                i, w = mo
-                sol = self.mortar_aim(me, shoot_at, w["stats"])
-                if sol:
-                    if w.get("cooldown", 0) <= 0.1:
-                        act["aim"] = [sol[0], max(-0.69, min(1.29, sol[1]))]
-                        if abs(wrap(me["aim"][0] - sol[0])) < 0.03 and abs(me["aim"][1] - sol[1]) < 0.03:
-                            fire[i] = True
-        else:
+        if "aim" not in act:
             # no target: look at threats, then sounds, else scan along travel
             look = None
             if self.last_hit_bearing is not None and t - self.last_hit_t < 3:
@@ -379,10 +663,6 @@ class Bot:
             gun = slots.get("gun")
             if gun and gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 99) < gun[1]["stats"].get("mag", 12) * 0.5:
                 act["reload"] = True
-        # never keep a laser charging without a target
-        lz = slots.get("laser")
-        if lz and shoot_at is None and (lz[1].get("charge") or 0) > 0:
-            fire[lz[0]] = False
         act["fire"] = fire
 
         self.nav.work(max(0.0, 0.015 - (time.perf_counter() - t_start)))

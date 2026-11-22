@@ -12,6 +12,7 @@ from array import array
 from collections import deque
 
 CELL = 2.0          # meters per nav cell
+SHOT_BIN = 16       # coarse spatial index for 3D combat rays
 WALK_H = 9.0        # mech height: overhangs lower than this are walls
 STEP = 1.2
 MAX_SLOPE = math.tan(math.radians(46))
@@ -70,6 +71,7 @@ class Nav:
         self.terrain = None
         self.blocked = None
         self.prisms = []
+        self.shot_prisms = {}
         self.field = None          # (goal, dist array)
         self._want = None          # goal requested
         self._lock = threading.Lock()
@@ -125,6 +127,9 @@ class Nav:
             j0 = max(0, int((y0 - self.miny) / CELL))
             j1 = min(gy - 1, int((y1 - self.miny) / CELL) + 1)
             base, top = p["base"], p["top"]
+            for by in range(math.floor(y0 / SHOT_BIN), math.floor(y1 / SHOT_BIN) + 1):
+                for bx in range(math.floor(x0 / SHOT_BIN), math.floor(x1 / SHOT_BIN) + 1):
+                    self.shot_prisms.setdefault((bx, by), []).append(self.prisms[-1])
             for j in range(j0, j1 + 1):
                 y = self.miny + (j + 0.5) * CELL
                 for i in range(i0, i1 + 1):
@@ -318,4 +323,24 @@ class Nav:
                     if x0 <= x <= x1 and y0 <= y <= y1 and base <= z <= top and _pip(x, y, ring):
                         if not any(_pip(x, y, h) for h in holes):
                             return False
+        return True
+
+    def combat_los(self, a, b):
+        """Sample shot geometry independently of the walking obstruction grid."""
+        if not self.ready:
+            return True
+        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        steps = max(1, math.ceil(max(math.hypot(dx, dy), abs(dz)) / 2))
+        prisms = self.shot_prisms
+        height = self.terrain.height
+        for i in range(1, steps + 1):
+            t = i / steps
+            x, y, z = a[0] + dx * t, a[1] + dy * t, a[2] + dz * t
+            if height(x, y) >= z:
+                return False
+            for x0, y0, x1, y1, ring, holes, base, top in prisms.get(
+                    (math.floor(x / SHOT_BIN), math.floor(y / SHOT_BIN)), ()):
+                if (x0 <= x <= x1 and y0 <= y <= y1 and base <= z <= top and _pip(x, y, ring)
+                        and not any(_pip(x, y, hole) for hole in holes)):
+                    return False
         return True
