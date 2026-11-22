@@ -180,23 +180,55 @@ class Bot:
         def d2(p):
             return math.dist((x, y), (p[0], p[1]))
 
-        # ---------------- target choice
-        target = None
-        if mechs:
-            def score(m):
-                d = d2(m["pos"])
-                s = d
-                if m["id"] in self.threat and t - self.threat[m["id"]][0] < 4:
-                    s -= 60
-                s -= 40 * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
-                return s
-            target = min(mechs, key=score)
-        tdist = d2(target["pos"]) if target else 1e9
-
         travel = self.must_travel(obs, me)
         goal = self.zone_goal(obs, me)
         mode = "zone"
         move_to = goal
+
+        # An attacker may still be tracked after moving behind a wall.
+        contacts = [(d2(m["pos"]), m) for m in mechs]
+        attackers = {mid for mid, hit in self.threat.items() if 0 <= mid < 16 and t - hit[0] < 4}
+        nearby = attackers | {m["id"] for distance, m in contacts if distance < 130}
+        outnumbered = len(nearby) > 1
+        low_energy = me["energy"] < 0.20 * me.get("max_energy", 100)
+        muzzle = (x, y, z + me["stats"].get("muzzle_height", 7))
+
+        def shot_clear(actor):
+            px, py, pz = actor["pos"]
+            return self.nav.los(muzzle, (px, py, pz + 3))
+
+        ranked = []
+        for distance, m in contacts:
+            if distance >= 230:
+                continue
+            recent = m["id"] in attackers
+            bearing = math.atan2(y - m["pos"][1], x - m["pos"][0])
+            aim_error = abs(wrap(bearing - m["aim"][0]))
+            defend = recent or distance < 55 or (distance < 160 and aim_error < 0.45)
+            enemy_max_hp = max(1, m.get("max_hp", 1400))
+            enemy_hp = m.get("hp", enemy_max_hp)
+            weak = enemy_hp <= min(me["hp"], 0.45 * enemy_max_hp)
+            advantage = me["hp"] > 1.10 * enemy_hp or (
+                aim_error > math.pi / 2 and me["hp"] >= 0.85 * enemy_hp
+            )
+            attack = (not travel and not (nearby - {m["id"]}) and hp_frac >= 0.60 and not low_energy
+                      and ((weak and distance < 180) or (advantage and distance < 160)))
+            if defend or attack or (outnumbered and m["id"] in nearby):
+                retreat = outnumbered or low_energy or hp_frac < 0.45 or me["hp"] < 0.70 * enemy_hp
+                rank = (not recent, not defend, distance - 40 * (1 - enemy_hp / enemy_max_hp))
+                ranked.append((rank, m, distance, defend or attack, retreat, attack))
+
+        target = None
+        tdist = 1e9
+        engage = retreat = push = False
+        mortar = slots.get("mortar")
+        for _, m, distance, shoot, withdraw, advantage in sorted(ranked, key=lambda row: row[0])[:3]:
+            # A ready mortar can still lob at a recent attacker without a direct ray.
+            indirect = m["id"] in attackers and mortar and 25 < distance < 220 and mortar[1].get("cooldown", 0) <= 0.1
+            if shot_clear(m) or indirect:
+                target, tdist = m, distance
+                engage, retreat, push = shoot, withdraw, advantage
+                break
 
         # ---------------- farming / looting when safe
         nearest_mech = min((d2(m["pos"]) for m in mechs), default=1e9)
@@ -262,7 +294,7 @@ class Bot:
         boost = not me.get("in_zone", True) or travel and dgoal > 60
 
         # combat movement: strafe / retreat
-        fighting = target is not None and tdist < 160
+        fighting = target is not None and me.get("in_zone", True) and (tdist < 160 or retreat)
         if fighting:
             ty_ = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
             px, py = -math.sin(ty_), math.cos(ty_)
@@ -270,15 +302,15 @@ class Bot:
                 self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.7 else self.strafe_sign
                 self.strafe_until = t + self.rng.uniform(0.6, 1.6)
             sx, sy = px * self.strafe_sign, py * self.strafe_sign
-            their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
-            retreat = hp_frac < 0.35 and their > hp_frac
             if retreat:
                 ax, ay = -math.cos(ty_), -math.sin(ty_)
                 mv = norm2(ax * 0.7 + sx * 0.5 + mv[0] * 0.6, ay * 0.7 + sy * 0.5 + mv[1] * 0.6)
                 boost = me["energy"] > 25
                 mode = "retreat"
             else:
-                want_close = "lightning" in slots and tdist > 35
+                zone = obs["zone"]
+                want_close = (push and "lightning" in slots and 35 < tdist < 75
+                              and math.dist(target["pos"][:2], zone["next_center"]) <= zone["next_radius"])
                 fx, fy = (math.cos(ty_), math.sin(ty_)) if want_close else (0.0, 0.0)
                 mv = norm2(sx + mv[0] * 0.5 + fx * 0.6, sy + mv[1] * 0.5 + fy * 0.6)
                 mode = "fight"
@@ -321,11 +353,7 @@ class Bot:
 
         # ---------------- aiming and firing
         fire = [False, False]
-        shoot_at = None
-        if target is not None and tdist < 230:
-            shoot_at = target
-        elif farm_target is not None:
-            shoot_at = farm_target
+        shoot_at = target if engage else farm_target
 
         if shoot_at is not None:
             gun = slots.get("gun")
@@ -333,9 +361,7 @@ class Bot:
             yaw, pitch, hd = self.lead(me, shoot_at, gspeed)
             act["aim"] = [yaw, max(-0.69, min(1.29, pitch))]
             aligned = self.aligned(me, yaw, pitch, hd, 2.0 if shoot_at.get("kind") == "mech" else 1.4)
-            eye = (x, y, z + me["stats"].get("muzzle_height", 7))
-            tp = (shoot_at["pos"][0], shoot_at["pos"][1], shoot_at["pos"][2] + 3)
-            clear = self.nav.los(eye, tp) if hd < 230 else False
+            clear = hd < 230 and shot_clear(shoot_at)
             if gun and aligned and clear and hd < gun[1]["stats"].get("range", 230):
                 if gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 1) > 0:
                     fire[gun[0]] = True
@@ -369,6 +395,8 @@ class Bot:
             look = None
             if self.last_hit_bearing is not None and t - self.last_hit_t < 3:
                 look = self.last_hit_bearing
+            elif target is not None:
+                look = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
             elif self.sound_look and self.sound_look[0] > t:
                 look = self.sound_look[1]
             if look is None:
